@@ -1,0 +1,175 @@
+---
+title: "Macro Training"
+author: "Mikhailov Aleksandr"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+params:
+  country: "RU"
+  start_year: 2000
+---
+
+<!-- params: country - ISO2-код страны (RU, KZ, BR, IN, CN, TR), start_year - начало выборки -->
+
+*Динамика, прогноз и реакция на шок денежной политики.*
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5, dpi = 110)
+
+pkgs <- c("tidyverse", "WDI", "quantmod", "tseries", "forecast",
+          "vars", "scales", "knitr")
+new_pkgs <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(new_pkgs)) install.packages(new_pkgs, repos = "https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+select <- dplyr::select
+
+theme_set(theme_minimal(base_size = 12))
+set.seed(123)
+```
+
+1. **Сравнительный анализ** ключевых индикаторов (рост ВВП, инфляция, безработица, счёт текущих операций) для выбранной страны и группы стран-аналогов.
+2. **Временной ряд и прогноз**: проверка стационарности, построение ARIMA, оценка точности на отложенной выборке в сравнении с наивными прогнозами.
+
+```{r wdi-load}
+indicators <- c(
+  gdp_growth   = "NY.GDP.MKTP.KD.ZG",   
+  inflation    = "FP.CPI.TOTL.ZG",      
+  unemployment = "SL.UEM.TOTL.ZS",      
+  current_acc  = "BN.CAB.XOKA.GD.ZS"    
+)
+
+labels_ind <- c(
+  gdp_growth   = "Рост ВВП, % г/г",
+  inflation    = "Инфляция (ИПЦ), % г/г",
+  unemployment = "Безработица, % рабочей силы",
+  current_acc  = "Счёт текущих операций, % ВВП"
+)
+
+countries <- unique(c(params$country, "KZ", "BR", "IN", "CN", "TR"))
+end_year  <- as.integer(format(Sys.Date(), "%Y"))
+
+wdi_raw <- WDI(country = countries, indicator = indicators,
+               start = params$start_year, end = end_year)
+
+home_name <- wdi_raw$country[wdi_raw$iso2c == params$country][1]
+
+wdi_long <- wdi_raw %>%
+  pivot_longer(all_of(names(indicators)),
+               names_to = "indicator", values_to = "value") %>%
+  mutate(indicator = factor(indicator, levels = names(labels_ind),
+                            labels = labels_ind),
+         home = iso2c == params$country)
+```
+
+```{r wdi-plot, fig.height=7}
+ggplot(wdi_long, aes(year, value, colour = country,
+                     group = country, linewidth = home)) +
+  geom_line(na.rm = TRUE) +
+  facet_wrap(~ indicator, scales = "free_y") +
+  scale_linewidth_manual(values = c(`FALSE` = 0.5, `TRUE` = 1.4), guide = "none") +
+  labs(title = paste("Ключевые макроиндикаторы:", home_name, "и страны-аналоги"),
+       x = NULL, y = NULL, colour = NULL,
+       caption = "Источник: World Bank, World Development Indicators") +
+  theme(legend.position = "bottom")
+```
+
+## Средние значения по периодам
+
+```{r wdi-periods}
+period_tbl <- wdi_raw %>%
+  mutate(period = cut(year, breaks = c(-Inf, 2013, 2019, Inf),
+                      labels = c("до 2013", "2014–2019", "2020 и позже"))) %>%
+  group_by(country, period) %>%
+  summarise(across(all_of(names(indicators)), ~ mean(.x, na.rm = TRUE)),
+            .groups = "drop") %>%
+  mutate(across(where(is.numeric), ~ round(.x, 1))) %>%
+  arrange(country != home_name, country, period)
+
+kable(period_tbl,
+      col.names = c("Страна", "Период", labels_ind),
+      caption = "Средние значения индикаторов (первой показана выбранная страна)")
+```
+
+## Волатильность роста ВВП
+
+```{r wdi-vol}
+vol_tbl <- wdi_raw %>%
+  group_by(country) %>%
+  summarise(`Ср. рост, %` = round(mean(gdp_growth, na.rm = TRUE), 2),
+            `Ст. отклонение, п.п.` = round(sd(gdp_growth, na.rm = TRUE), 2),
+            .groups = "drop") %>%
+  arrange(`Ст. отклонение, п.п.`)
+
+kable(vol_tbl, caption = "Чем ниже стандартное отклонение, тем стабильнее рост")
+```
+
+# 2. Временной ряд: стационарность и прогноз роста ВВП
+
+```{r ts-prep}
+home <- wdi_raw %>%
+  filter(iso2c == params$country) %>%
+  arrange(year) %>%
+  select(year, gdp_growth) %>%
+  drop_na()
+
+y <- ts(home$gdp_growth, start = min(home$year), frequency = 1)
+last_year <- max(home$year)
+```
+
+## Тесты на стационарность
+
+```{r ts-tests}
+adf  <- adf.test(y)
+kpss <- kpss.test(y)
+
+tibble(
+  Тест = c("ADF (H0: единичный корень)", "KPSS (H0: стационарность)"),
+  Статистика = round(c(adf$statistic, kpss$statistic), 3),
+  `p-value` = round(c(adf$p.value, kpss$p.value), 3)
+) %>% kable()
+```
+
+Если ADF не отвергает нулевую гипотезу, а KPSS отвергает, дифференциация ряда данных. На коротком годовом ряду мощность тестов ограничена, поэтому результат нужно трактовать осторожно.
+
+## Сравнение точности прогнозов на отложенной выборке
+
+```{r ts-holdout}
+h <- 4
+train <- window(y, end = last_year - h)
+test  <- window(y, start = last_year - h + 1)
+
+fit_arima <- auto.arima(train, seasonal = FALSE, ic = "aicc")
+
+fc <- list(
+  ARIMA  = as.numeric(forecast(fit_arima, h = h)$mean),
+  Naive  = as.numeric(naive(train, h = h)$mean),
+  Mean   = as.numeric(meanf(train, h = h)$mean)
+)
+
+acc <- purrr::imap_dfr(fc, function(f, nm) {
+  tibble(Модель = nm,
+         RMSE = sqrt(mean((as.numeric(test) - f)^2)),
+         MAE  = mean(abs(as.numeric(test) - f)))
+}) %>% mutate(across(where(is.numeric), ~ round(.x, 2))) %>% arrange(RMSE)
+
+kable(acc, caption = paste0("Точность прогноза на ", h,
+      " последних года (чем меньше, тем лучше). Выбранная ARIMA: ",
+      paste0("(", paste(arimaorder(fit_arima)[1:3], collapse = ","), ")")))
+```
+
+## Прогноз на 3 года вперёд
+
+```{r ts-forecast}
+fit_full <- auto.arima(y, seasonal = FALSE, ic = "aicc")
+fc_full  <- forecast(fit_full, h = 3, level = c(80, 95))
+
+autoplot(fc_full) +
+  labs(title = paste("Рост ВВП:", home_name, "— прогноз ARIMA"),
+       x = NULL, y = "% г/г",
+       caption = "Источник: World Bank; расчёты автора")
+```
